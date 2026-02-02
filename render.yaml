@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: douyin-live-feishu-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: FEISHU_APP_ID
+        value: cli_a9f642df71f85cc2
+      - key: FEISHU_APP_SECRET
+        value: qHOZbVFfLXn3z0h5eST4KdSgqpTsHJuy
+
