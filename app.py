@@ -1,6 +1,6 @@
 """
-TikTok Live Stream Analysis Bot - Strict Feishu Compliance Version
-严格遵循飞书回调要求的版本
+TikTok Live Stream Analysis Bot - Fixed Version
+修复事件类型和@用户名的解析问题
 """
 
 import os
@@ -9,6 +9,7 @@ import json
 import requests
 import base64
 import logging
+import re
 from flask import Flask, request, jsonify
 
 # 配置日志
@@ -39,10 +40,7 @@ def health():
 
 @app.route('/api/feishu/webhook', methods=['GET', 'POST'])
 def feishu_webhook():
-    """
-    飞书事件回调
-    支持 GET (URL验证) 和 POST (事件回调)
-    """
+    """飞书事件回调"""
     logger.info(f"Received request: method={request.method}, args={dict(request.args)}")
     
     # ==================== GET 请求：URL 验证 ====================
@@ -52,53 +50,61 @@ def feishu_webhook():
         
         if challenge:
             response = jsonify({"challenge": challenge})
-            logger.info(f"Returning challenge response: {response.get_data(as_text=True)}")
+            logger.info(f"Returning challenge: {response.get_data(as_text=True)}")
             return response
         else:
-            logger.warning("GET request without challenge parameter")
+            logger.warning("GET request without challenge")
             return jsonify({"code": 0, "msg": "success"})
     
     # ==================== POST 请求：事件回调 ====================
     if request.method == 'POST':
         try:
-            # 获取原始请求数据
             event_data = request.get_json()
-            logger.info(f"Received POST event: {json.dumps(event_data, ensure_ascii=False)[:500]}")
+            logger.info(f"Received event: {json.dumps(event_data, ensure_ascii=False)[:500]}")
             
             if event_data is None:
-                logger.error("No JSON data in POST request")
+                logger.error("No JSON data in POST")
                 return jsonify({"code": -1, "msg": "No data"})
             
             # URL 验证事件
             if event_data.get('type') == 'url_verification':
                 challenge = event_data.get('challenge', '')
-                logger.info(f"URL verification event, challenge={challenge}")
-                
-                response = jsonify({"challenge": challenge})
-                logger.info(f"Returning challenge: {response.get_data(as_text=True)}")
-                return response
+                logger.info(f"URL verification, challenge={challenge}")
+                return jsonify({"challenge": challenge})
             
-            # 消息回调事件
-            if event_data.get('type') == 'event_callback':
+            # 获取事件类型
+            event_type = event_data.get('header', {}).get('event_type', '')
+            logger.info(f"Event type: {event_type}")
+            
+            # 消息接收事件 (im.message.receive_v1)
+            if event_type == 'im.message.receive_v1':
                 event = event_data.get('event', {})
                 message = event.get('message', {})
                 msg_type = message.get('msg_type')
                 content = message.get('content')
                 
-                logger.info(f"Message received: type={msg_type}")
+                logger.info(f"Message: type={msg_type}, content={content}")
                 
                 # 处理文本消息
                 if msg_type == 'text':
                     try:
+                        # 解码base64内容
                         text_content = base64.b64decode(content).decode('utf-8')
-                        logger.info(f"Text content: {text_content}")
+                        logger.info(f"Raw text: {text_content}")
                         
+                        # 去掉 @用户名 标记
+                        text_content = re.sub(r'@_user_\d+\s*', '', text_content).strip()
+                        logger.info(f"Cleaned text: {text_content}")
+                        
+                        # 解析数据
                         data = parse_live_data(text_content)
                         if data:
+                            logger.info(f"Parsed data: {data}")
                             analysis = analyze_data(data)
                             card = create_analysis_card(data, analysis)
                             return send_card(card, event)
                         else:
+                            logger.warning(f"Cannot parse data from: {text_content}")
                             return send_text("请发送格式: GMV=1000, 观众数=5000, 订单数=50", event)
                     except Exception as e:
                         logger.error(f"Error processing text: {e}")
@@ -112,21 +118,24 @@ def feishu_webhook():
                     card = create_analysis_card(data, analysis)
                     return send_card(card, event)
             
-            # 其他事件类型
-            logger.info(f"Other event type: {event_data.get('type')}")
+            # 机器人被添加/移除事件
+            if event_type in ['im.chat.member.bot.added_v1', 'im.chat.member.bot.deleted_v1']:
+                logger.info(f"Bot {event_type.split('.')[-1]}")
+                return jsonify({"code": 0, "msg": "success"})
+            
+            # 其他事件
+            logger.info(f"Other event: {event_type}")
             return jsonify({"code": 0, "msg": "success"})
         
         except Exception as e:
             logger.error(f"Error processing POST: {e}")
             return jsonify({"code": -1, "msg": str(e)})
     
-    # 其他请求方法
     logger.warning(f"Unsupported method: {request.method}")
     return jsonify({"code": -1, "msg": "Method not allowed"})
 
 def parse_live_data(text):
     """解析直播数据"""
-    import re
     data = {}
     
     # 匹配 GMV
@@ -164,7 +173,7 @@ def analyze_data(data):
     if conversion_rate < 0.5:
         analysis['issues'].append({
             'title': '转化率严重偏低',
-            'description': f'当前 {conversion_rate:.2f}%，行业基准 1%',
+            'description': f'当前 {conversion_rate:.2f}%，需立即优化',
             'metric': f'转化率: {conversion_rate:.2f}%'
         })
     elif conversion_rate < 1.0:
@@ -268,20 +277,21 @@ def create_analysis_card(data, analysis):
 def send_card(card, event):
     """发送卡片消息"""
     try:
+        logger.info("Sending card message...")
+        
         # 获取 token
         token_url = 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal'
         token_data = {'app_id': FEISHU_APP_ID, 'app_secret': FEISHU_APP_SECRET}
         
-        logger.info("Requesting tenant access token")
         token_response = requests.post(token_url, json=token_data, timeout=30)
         token_result = token_response.json()
         
         if token_result.get('code') != 0:
-            logger.error(f"Token request failed: {token_result}")
+            logger.error(f"Token failed: {token_result}")
             return jsonify({'code': -1, 'msg': f'token失败: {token_result.get("msg")}'})
         
         token = token_result.get('tenant_access_token')
-        logger.info("Token obtained successfully")
+        logger.info("Token obtained")
         
         # 获取用户 ID
         receive_id = event.get('sender', {}).get('sender_id', {}).get('open_id')
@@ -292,7 +302,7 @@ def send_card(card, event):
             logger.error("Cannot get receive_id")
             return jsonify({'code': -1, 'msg': '无法获取用户ID'})
         
-        logger.info(f"Sending card to user: {receive_id}")
+        logger.info(f"Sending to user: {receive_id}")
         
         # 发送消息
         msg_url = 'https://open.feishu.cn/open-apis/im/v1/messages'
@@ -310,7 +320,7 @@ def send_card(card, event):
         msg_response = requests.post(msg_url, params=msg_params, headers=msg_headers, json=msg_payload, timeout=30)
         result = msg_response.json()
         
-        logger.info(f"Message send result: {result}")
+        logger.info(f"Send result: {result}")
         return jsonify(result)
     
     except Exception as e:
