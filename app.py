@@ -307,8 +307,8 @@ def send_card(card, event):
             'content': json.dumps({'card': card})
         }
         
-        msg_response = requests.post(msg_url, params=msg_params, headers=msg_headers, json=msg_payload,        result = msg timeout=30)
-_response.json()
+        msg_response = requests.post(msg_url, params=msg_params, headers=msg_headers, json=msg_payload, timeout=30)
+        result = msg_response.json()
         
         logger.info(f"Message send result: {result}")
         return jsonify(result)
