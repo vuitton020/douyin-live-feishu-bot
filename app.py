@@ -1,240 +1,338 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-TikTok Live Stream Analysis Bot - 修复飞书新版本事件格式
+抖音直播数据飞书机器人 - 修复版
+支持飞书机器人接收直播数据并自动生成分析报告
 """
 
 import os
 import json
-import requests
-import base64
 import re
+import logging
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
+from flask_cors import CORS
+import requests
+from concurrent.futures import ThreadPoolExecutor
 
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+CORS(app)
+
+# 飞书应用配置
 FEISHU_APP_ID = os.environ.get('FEISHU_APP_ID', 'cli_a9f642df71f85cc2')
 FEISHU_APP_SECRET = os.environ.get('FEISHU_APP_SECRET', 'qHOZbVFfLXn3z0h5eST4KdSgqpTsHJuy')
 
-app = Flask(__name__)
+# 缓存access_token
+access_token_cache = {'token': None, 'expire_time': None}
+token_executor = ThreadPoolExecutor(max_workers=1)
 
-print("TikTok直播分析机器人启动")
-print(f"FEISHU_APP_ID: {FEISHU_APP_ID[:10]}...")
-print(f"PORT: {os.environ.get('PORT', '10000')}")
+def get_tenant_access_token():
+    """获取飞书应用访问令牌"""
+    global access_token_cache
+    
+    # 检查缓存是否有效
+    if (access_token_cache['token'] and 
+        access_token_cache['expire_time'] and 
+        datetime.now() < access_token_cache['expire_time']):
+        return access_token_cache['token']
+    
+    try:
+        url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        payload = {
+            "app_id": FEISHU_APP_ID,
+            "app_secret": FEISHU_APP_SECRET
+        }
+        
+        response = requests.post(url, headers=headers, json=payload)
+        data = response.json()
+        
+        if data.get('code') == 0:
+            access_token_cache['token'] = data.get('tenant_access_token')
+            # 提前5分钟刷新
+            access_token_cache['expire_time'] = datetime.now() + timedelta(minutes=115)
+            return access_token_cache['token']
+        else:
+            logger.error(f"获取access_token失败: {data}")
+            return None
+    except Exception as e:
+        logger.error(f"获取access_token异常: {e}")
+        return None
+
+def send_feishu_message(receive_id, msg_type, content):
+    """发送飞书消息"""
+    try:
+        token = get_tenant_access_token()
+        if not token:
+            return False, "获取访问令牌失败"
+        
+        url = "https://open.feishu.cn/open-apis/im/v1/messages"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+        params = {"receive_id_type": "open_id"}
+        
+        payload = {
+            "receive_id": receive_id,
+            "msg_type": msg_type,
+            "content": json.dumps(content)
+        }
+        
+        response = requests.post(url, headers=headers, params=params, json=payload)
+        data = response.json()
+        
+        if data.get('code') == 0:
+            return True, "发送成功"
+        else:
+            logger.error(f"发送消息失败: {data}")
+            return False, str(data)
+    except Exception as e:
+        logger.error(f"发送消息异常: {e}")
+        return False, str(e)
+
+def parse_live_stream_data(text):
+    """解析直播数据"""
+    data = {}
+    
+    # 提取GMV
+    gmv_match = re.search(r'[Gg][Mm][Vv][=：:\s]*([\d.]+)', text)
+    if gmv_match:
+        data['gmv'] = float(gmv_match.group(1))
+    
+    # 提取观众数
+    viewer_match = re.search(r'观众[数]?[=：:\s]*([\d,]+)', text)
+    if not viewer_match:
+        viewer_match = re.search(r'[Vv]iewers?[=：:\s]*([\d,]+)', text)
+    if not viewer_match:
+        viewer_match = re.search(r'观看[人]?[=：:\s]*([\d,]+)', text)
+    if viewer_match:
+        data['viewers'] = int(viewer_match.group(1).replace(',', ''))
+    
+    # 提取订单数
+    order_match = re.search(r'订单[数]?[=：:\s]*([\d,]+)', text)
+    if not order_match:
+        order_match = re.search(r'[Oo]rders?[=：:\s]*([\d,]+)', text)
+    if order_match:
+        data['orders'] = int(order_match.group(1).replace(',', ''))
+    
+    return data
+
+def analyze_live_stream(data):
+    """分析直播数据"""
+    if not data:
+        return None
+    
+    gmv = data.get('gmv', 0)
+    viewers = data.get('viewers', 1)
+    orders = data.get('orders', 0)
+    
+    # 基础指标
+    gpv = gmv / viewers if viewers > 0 else 0  # 每观众贡献
+    conversion = orders / viewers if viewers > 0 else 0  # 转化率
+    aov = gmv / orders if orders > 0 else 0  # 平均客单价
+    gpm = (gmv / 1000) * 100 if viewers > 0 else 0  # 千次曝光GMV
+    
+    # 质量评分 (0-100)
+    score = 0
+    score += min(gpv * 50, 25)  # 每观众贡献 (最多25分)
+    score += min(conversion * 500, 25)  # 转化率 (最多25分)
+    score += min(aov / 10, 25)  # 客单价 (最多25分)
+    score += min(gpm / 5, 25)  # 千次曝光GMV (最多25分)
+    score = min(score, 100)
+    
+    # 评级
+    if score >= 80:
+        rating = "S"
+    elif score >= 60:
+        rating = "A"
+    elif score >= 40:
+        rating = "B"
+    else:
+        rating = "C"
+    
+    return {
+        'gmv': gmv,
+        'viewers': viewers,
+        'orders': orders,
+        'gpv': round(gpv, 2),
+        'conversion_rate': f"{conversion*100:.2f}%",
+        'aov': round(aov, 2),
+        'score': int(score),
+        'rating': rating
+    }
+
+def generate_analysis_card(data):
+    """生成飞书交互卡片"""
+    analysis = analyze_live_stream(data)
+    
+    if not analysis:
+        return {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {"tag": "div", "text": {"tag": "plain_text", "content": "❌ 无法解析直播数据"}}
+            ]
+        }
+    
+    # 根据评分选择颜色和评语
+    score = analysis['score']
+    if score >= 80:
+        color = "green"
+        comment = "🌟 优秀表现！数据非常亮眼"
+    elif score >= 60:
+        color = "blue"
+        comment = "👍 良好表现，还有提升空间"
+    elif score >= 40:
+        color = "yellow"
+        comment = "💪 一般表现，需要优化策略"
+    else:
+        color = "red"
+        comment = "⚠️ 表现不佳，建议调整策略"
+    
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "📊 抖音直播数据分析报告"},
+            "template": color
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "plain_text",
+                    "content": f"📈 {comment}"
+                }
+            },
+            {"tag": "hr"},
+            {
+                "tag": "div",
+                "fields": [
+                    {"is_short": True, "text": {"tag": "plain_text", "content": f"💰 GMV\n**RM {analysis['gmv']:.2f}**"}},
+                    {"is_short": True, "text": {"tag": "plain_text", "content": f"👥 观众数\n**{analysis['viewers']:,}**"}},
+                    {"is_short": True, "text": {"tag": "plain_text", "content": f"📦 订单数\n**{analysis['orders']:,}**"}},
+                    {"is_short": True, "text": {"tag": "plain_text", "content": f"🎯 转化率\n**{analysis['conversion_rate']}**"}},
+                    {"is_short": True, "text": {"tag": "plain_text", "content": f"💳 客单价\n**RM {analysis['aov']:.2f}**"}},
+                    {"is_short": True, "text": {"tag": "plain_text", "content": f"👀 每观众贡献\n**RM {analysis['gpv']:.2f}**"}}
+                ]
+            },
+            {"tag": "hr"},
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "plain_text",
+                    "content": f"🏆 综合评分: **{analysis['rating']}** ({score}分)"
+                }
+            }
+        ]
+    }
+    
+    return card
 
 @app.route('/')
 def index():
-    return 'TikTok直播分析机器人服务运行正常'
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "ok"})
+    """健康检查"""
+    return jsonify({
+        "status": "running",
+        "service": "抖音直播飞书机器人",
+        "version": "2.0"
+    })
 
 @app.route('/api/feishu/webhook', methods=['GET', 'POST'])
 def feishu_webhook():
-    print(f"\n收到请求: {request.method}")
-    
-    # GET - URL验证
-    if request.method == 'GET':
-        challenge = request.args.get('challenge', '')
-        print(f"GET Challenge: {challenge}")
-        return jsonify({"challenge": challenge})
-    
-    # POST - 事件回调
+    """飞书事件回调"""
     try:
-        event = request.get_json(silent=True) or {}
-        print(f"Event type: {event.get('header', {}).get('event_type', 'unknown')}")
-        
-        event_type = event.get('header', {}).get('event_type', '')
-        
-        # URL验证事件
-        if event_type == 'url_verification':
-            challenge = event.get('challenge', '')
-            print(f"URL Verification: {challenge}")
+        # 验证请求
+        if request.method == 'GET':
+            challenge = request.args.get('challenge', '')
             return jsonify({"challenge": challenge})
         
-        # 消息回调事件 (兼容新旧版本)
+        event = request.json
+        logger.info(f"Received event: {json.dumps(event, ensure_ascii=False)}")
+        
+        # 检查事件类型
+        event_type = event.get('header', {}).get('event_type', '')
+        
         if event_type in ['im.message.receive_v1', 'im:message']:
             message = event.get('event', {}).get('message', {})
             
-            # 解析content
+            # 获取消息内容
             content_str = message.get('content', '{}')
-            print(f"Content raw: {content_str[:100]}...")
             
+            # 解析content JSON字符串
             try:
-                # content可能是JSON字符串
-                content = json.loads(content_str) if content_str.startswith('{') else {}
+                if content_str.startswith('{'):
+                    content = json.loads(content_str)
+                else:
+                    content = {}
             except:
                 content = {}
             
-            # 获取文本内容
+            # 提取文本内容
             text_content = content.get('text', '')
             if not text_content:
-                # 尝试从原始content提取
                 text_content = content_str
             
-            print(f"Text content: {text_content}")
+            # 移除@mentions
+            text_content = re.sub(r'@_user_\d+\s*', '', text_content).strip()
             
-            if text_content:
-                return handle_text_message(message, text_content, event)
-            else:
-                # 图片或其他类型
-                return jsonify({"code": 0, "msg": "消息已收到"})
+            logger.info(f"Message text: {text_content}")
+            
+            if not text_content:
+                return jsonify({"success": True})
+            
+            # 解析数据
+            data = parse_live_stream_data(text_content)
+            logger.info(f"Parsed data: {data}")
+            
+            # 生成分析卡片
+            card = generate_analysis_card(data)
+            
+            # 发送回复
+            receive_id = message.get('sender', {}).get('sender_id', {}).get('open_id', '')
+            
+            if receive_id:
+                send_feishu_message(
+                    receive_id=receive_id,
+                    msg_type="interactive",
+                    content=card
+                )
+            
+            return jsonify({"success": True})
         
-        return jsonify({"code": 0, "msg": "事件已处理"})
-    
+        return jsonify({"success": True})
+        
     except Exception as e:
-        print(f"Error: {e}")
-        return jsonify({"code": -1, "msg": str(e)})
+        logger.error(f"处理飞书事件异常: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
-def handle_text_message(message, text_content, event):
-    print(f"处理文本消息: {text_content}")
-    
-    # 清理文本（移除@提及等）
-    text_content = re.sub(r'@_user_\d+\s*', '', text_content)
-    text_content = text_content.strip()
-    
-    data = parse_live_data(text_content)
-    print(f"解析结果: {data}")
-    
-    if data:
-        analysis = analyze_data(data)
-        card = create_analysis_card(data, analysis)
-        return send_card(card, event)
-    else:
-        return send_text("请发送格式: GMV=数值, 观众数=数值, 订单数=数值", event)
-
-def parse_live_data(text):
-    data = {}
-    
-    match = re.search(r'[Gg][Mm][Vv][=：:\s]*([\d.]+)', text)
-    if match:
-        data['gmv'] = float(match.group(1))
-    
-    match = re.search(r'观众[人数]?[=：:\s]*(\d+)', text)
-    if match:
-        data['viewers'] = int(match.group(1))
-    
-    match = re.search(r'订单[数量]?[=：:\s]*(\d+)', text)
-    if match:
-        data['orders'] = int(match.group(1))
-    
-    return data if 'gmv' in data and 'viewers' in data and 'orders' in data else None
-
-def analyze_data(data):
-    gmv, viewers, orders = data.get('gmv', 0), data.get('viewers', 0), data.get('orders', 0)
-    rate = (orders / viewers * 100) if viewers > 0 else 0
-    
-    analysis = {'issues': [], 'insights': [], 'recommendations': []}
-    
-    if rate < 0.5:
-        analysis['issues'].append({'title': '转化率严重偏低', 'description': f'当前 {rate:.2f}%', 'metric': f'转化率: {rate:.2f}%'})
-    elif rate < 1.0:
-        analysis['issues'].append({'title': '转化率有待提升', 'description': f'当前 {rate:.2f}%', 'metric': f'转化率: {rate:.2f}%'})
-    
-    if orders > 0:
-        analysis['insights'].append({'title': '客单价', 'value': f'¥{gmv/orders:.2f}'})
-    
-    analysis['recommendations'] = [
-        {'priority': 'urgent', 'title': '优化开场话术', 'description': '准备吸引人的开场和福利预告'},
-        {'priority': 'medium', 'title': '提升互动频率', 'description': '每5-10分钟设置互动环节'},
-        {'priority': 'longterm', 'title': '建立粉丝群', 'description': '培养忠实用户提升复购'},
-    ]
-    return analysis
-
-def create_analysis_card(data, analysis):
-    issues = []
-    for issue in analysis.get('issues', [])[:3]:
-        emoji = '🔴' if '严重' in issue.get('title', '') else '🟠'
-        issues.extend([
-            {'tag': 'div', 'text': {'tag': 'plain_text', 'content': f"{emoji} {issue.get('title', '')}"}},
-            {'tag': 'div', 'text': {'tag': 'plain_text', 'content': f"📊 {issue.get('metric', '')}"}}
-        ])
-    if not issues:
-        issues = [{'tag': 'div', 'text': {'tag': 'plain_text', 'content': '✅ 数据表现良好'}}]
-    
-    insights = [{'tag': 'div', 'text': {'tag': 'plain_text', 'content': f"• {i.get('title', '')}: {i.get('value', '')}"}} for i in analysis.get('insights', [])[:2]]
-    
-    recs = []
-    for rec in analysis.get('recommendations', [])[:3]:
-        emoji = '🔴' if rec.get('priority') == 'urgent' else '🟡'
-        recs.extend([
-            {'tag': 'div', 'text': {'tag': 'plain_text', 'content': f"{emoji} **{rec.get('title', '')}**"}},
-            {'tag': 'div', 'text': {'tag': 'plain_text', 'content': f"   {rec.get('description', '')}"}}
-        ])
-    
-    return {
-        'config': {'wide_screen_mode': True},
-        'header': {'title': {'tag': 'plain_text', 'content': '📊 直播数据智能分析'}, 'template': 'blue'},
-        'elements': [
-            {'tag': 'column_set', 'flex_mode': 'stretch', 'columns': [
-                {'tag': 'column', 'width': 'weighted', 'weight': 1, 'elements': [{'tag': 'div', 'text': {'tag': 'plain_text', 'content': '💰 GMV'}}]},
-                {'tag': 'column', 'width': 'weighted', 'weight': 1, 'elements': [{'tag': 'div', 'text': {'tag': 'plain_text', 'content': '👥 观众'}}]},
-                {'tag': 'column', 'width': 'weighted', 'weight': 1, 'elements': [{'tag': 'div', 'text': {'tag': 'plain_text', 'content': '📦 订单'}}]},
-            ]},
-            {'tag': 'column_set', 'flex_mode': 'stretch', 'columns': [
-                {'tag': 'column', 'width': 'weighted', 'weight': 1, 'elements': [{'tag': 'div', 'text': {'tag': 'lark_md', 'content': f"**¥{data.get('gmv', 0):,.0f}**"}}]},
-                {'tag': 'column', 'width': 'weighted', 'weight': 1, 'elements': [{'tag': 'div', 'text': {'tag': 'lark_md', 'content': f"**{data.get('viewers', 0):,}**"}}]},
-                {'tag': 'column', 'width': 'weighted', 'weight': 1, 'elements': [{'tag': 'div', 'text': {'tag': 'lark_md', 'content': f"**{data.get('orders', 0):,}**"}}]},
-            ]},
-            {'tag': 'div', 'text': {'tag': 'separator'}},
-            {'tag': 'div', 'text': {'tag': 'plain_text', 'content': '🔍 问题诊断'}},
-            *issues,
-            {'tag': 'div', 'text': {'tag': 'separator'}},
-            {'tag': 'div', 'text': {'tag': 'plain_text', 'content': '💡 数据洞察'}},
-            *insights,
-            {'tag': 'div', 'text': {'tag': 'separator'}},
-            {'tag': 'div', 'text': {'tag': 'plain_text', 'content': '🚀 优化建议'}},
-*recs,
-        ]
-    }
-
-def send_card(card, event):
+@app.route('/api/analyze', methods=['POST'])
+def analyze():
+    """直接分析接口"""
     try:
-        token_resp = requests.post('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
-            json={'app_id': FEISHU_APP_ID, 'app_secret': FEISHU_APP_SECRET}, timeout=30)
-        token_data = token_resp.json()
-        if token_data.get('code') != 0:
-            print(f"Token failed: {token_data.get('msg')}")
-            return jsonify({'code': -1, 'msg': f'token失败: {token_data.get("msg")}'})
+        data = request.json
+        text = data.get('text', '')
         
-        token = token_data.get('tenant_access_token')
-        receive_id = event.get('event', {}).get('sender', {}).get('sender_id', {}).get('open_id')
-        if not receive_id:
-            receive_id = event.get('event', {}).get('message', {}).get('sender', {}).get('open_id')
+        parsed = parse_live_stream_data(text)
+        analysis = analyze_live_stream(parsed)
         
-        if not receive_id:
-            print("无法获取用户ID")
-            return jsonify({'code': -1, 'msg': '无法获取用户ID'})
-        
-        print(f"发送消息给用户: {receive_id}")
-        
-        msg_resp = requests.post('https://open.feishu.cn/open-apis/im/v1/messages',
-            params={'receive_id_type': 'open_id'},
-            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json; charset=utf-8'},
-            json={'receive_id': receive_id, 'msg_type': 'interactive', 'content': json.dumps({'card': card})},
-            timeout=30)
-        
-        print(f"发送结果: {msg_resp.status_code}")
-        result = msg_resp.json()
-        print(f"发送详情: {json.dumps(result, ensure_ascii=False)[:200]}")
-        return jsonify(result)
+        return jsonify({
+            "success": True,
+            "original": data,
+            "parsed": parsed,
+            "analysis": analysis
+        })
     except Exception as e:
-        print(f"发送失败: {e}")
-        return jsonify({'code': -1, 'msg': str(e)})
-
-def send_text(text, event):
-    try:
-        token_resp = requests.post('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
-            json={'app_id': FEISHU_APP_ID, 'app_secret': FEISHU_APP_SECRET}, timeout=30)
-        token = token_resp.json().get('tenant_access_token')
-        receive_id = event.get('event', {}).get('sender', {}).get('sender_id', {}).get('open_id')
-        
-        msg_resp = requests.post('https://open.feishu.cn/open-apis/im/v1/messages',
-            params={'receive_id_type': 'open_id'},
-            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
-            json={'receive_id': receive_id, 'msg_type': 'text', 'content': json.dumps({'text': text})},
-            timeout=30)
-        return jsonify(msg_resp.json())
-    except Exception as e:
-        return jsonify({'code': -1, 'msg': str(e)})
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
